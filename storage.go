@@ -216,6 +216,37 @@ func (h *DHCPHandler) revokeLease(ctx context.Context, nic string) error {
 	return errors.Wrap(err, "could not delete lease")
 }
 
+func (h *DHCPHandler) setHostname(ctx context.Context, nic string, hostname string, ttl time.Duration) error {
+	lease, err := etcd.NewLease(h.client).Grant(ctx, int64(ttl.Seconds()))
+	if err != nil {
+		return errors.Wrap(err, "could not create new lease")
+	}
+
+	nicKey := h.prefix + "nics::hostname::" + nic
+
+	_, err = etcd.NewKV(h.client).Do(ctx, etcd.OpPut(nicKey, hostname, etcd.WithLease(lease.ID)))
+	if err != nil {
+		return errors.Wrap(err, "could not register hostname")
+	}
+
+	return nil
+}
+
+func (h *DHCPHandler) unsetHostname(ctx context.Context, nic string) error {
+	nicKey := h.prefix + "nics::hostname::" + nic
+
+	_, err := etcd.NewKV(h.client).Txn(ctx).If(
+		etcdutil.KeyExists(nicKey),
+	).Then(
+		etcd.OpDelete(nicKey),
+	).Commit()
+	if err != nil {
+		return errors.Wrap(err, "could not delete hostname")
+	}
+
+	return nil
+}
+
 func parseIP4(raw string) net.IP {
 	ip := net.ParseIP(raw)
 	if ip == nil {
