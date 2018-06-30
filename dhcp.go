@@ -3,8 +3,8 @@ package main
 import (
 	"context"
 	"net"
-	"time"
 	"strings"
+	"time"
 
 	etcd "github.com/coreos/etcd/clientv3"
 	"github.com/golang/glog"
@@ -50,7 +50,7 @@ func (h *DHCPHandler) ServeDHCP(p dhcp.Packet, msgType dhcp.MessageType, options
 		if reqIP == nil {
 			reqIP = net.IP(p.CIAddr())
 		}
-		hostnameBytes, ok := options[dhcp.OptionHostName];
+		hostnameBytes, ok := options[dhcp.OptionHostName]
 		var hostname string
 		if ok {
 			hostname = string(hostnameBytes)
