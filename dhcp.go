@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"net"
+	"strings"
 	"time"
 
 	etcd "github.com/coreos/etcd/clientv3"
@@ -49,8 +50,15 @@ func (h *DHCPHandler) ServeDHCP(p dhcp.Packet, msgType dhcp.MessageType, options
 		if reqIP == nil {
 			reqIP = net.IP(p.CIAddr())
 		}
+		hostnameBytes, ok := options[dhcp.OptionHostName]
+		var hostname string
+		if ok {
+			hostname = string(hostnameBytes)
+		} else {
+			hostname = strings.Replace(p.CHAddr().String(), ":", "-", -1)
+		}
 
-		ip, err := h.handleRequest(ctx, reqIP, p.CHAddr().String())
+		ip, err := h.handleRequest(ctx, reqIP, p.CHAddr().String(), hostname)
 		if err != nil {
 			glog.Errorf("could not lease: %v", err)
 			return dhcp.ReplyPacket(p, dhcp.NAK, h.ip, nil, 0, nil)
@@ -63,6 +71,10 @@ func (h *DHCPHandler) ServeDHCP(p dhcp.Packet, msgType dhcp.MessageType, options
 		err := h.revokeLease(ctx, p.CHAddr().String())
 		if err != nil {
 			glog.Errorf("could not revoke lease for %v: %v", p.CHAddr().String(), err)
+		}
+		err = h.unsetHostname(ctx, p.CHAddr().String())
+		if err != nil {
+			glog.Errorf("could not delete hostname for %v: %v", p.CHAddr().String(), err)
 		}
 	}
 	return nil
@@ -84,8 +96,8 @@ func (h *DHCPHandler) handleDiscover(ctx context.Context, nic string) (net.IP, e
 	return new, nil
 }
 
-func (h *DHCPHandler) handleRequest(ctx context.Context, ip net.IP, nic string) (net.IP, error) {
-	glog.Infof("handling request for %v from %v", ip, nic)
+func (h *DHCPHandler) handleRequest(ctx context.Context, ip net.IP, nic string, hostname string) (net.IP, error) {
+	glog.Infof("handling request for %v from %v (%v)", ip, nic, hostname)
 	if len(ip) != 4 || ip.Equal(net.IPv4zero) {
 		return nil, errors.New("invalid ip requested")
 	}
@@ -94,5 +106,11 @@ func (h *DHCPHandler) handleRequest(ctx context.Context, ip net.IP, nic string) 
 	if err != nil {
 		return nil, errors.Wrap(err, "could not update lease")
 	}
+
+	err = h.setHostname(ctx, nic, hostname, h.leaseDuration*2)
+	if err != nil {
+		return nil, errors.Wrap(err, "could not update hostname")
+	}
+
 	return ip, nil
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"net"
 	"strings"
 	"time"
@@ -214,6 +215,100 @@ func (h *DHCPHandler) revokeLease(ctx context.Context, nic string) error {
 		etcd.OpPut(freeIPKey, ip),
 	).Commit()
 	return errors.Wrap(err, "could not delete lease")
+}
+
+func (h *DHCPHandler) setHostname(ctx context.Context, nic string, hostname string, ttl time.Duration) error {
+	lease, err := etcd.NewLease(h.client).Grant(ctx, int64(ttl.Seconds()))
+	if err != nil {
+		return errors.Wrap(err, "could not create new lease")
+	}
+
+	nic2hnKey := h.prefix + "nics::hostname::" + nic
+	// Because several NICs can have the same hostname,
+	// etcd key name contains NIC identifier as its suffix.
+	hn2nicKey := h.prefix + "hostnames::nic::" + hostname + "::" + nic
+
+	kvc := etcd.NewKV(h.client)
+	resp, err := kvc.Get(ctx, nic2hnKey)
+	if err != nil {
+		return errors.Wrap(err, "could not search hostname for the NIC")
+	}
+	var existingHostname string
+	if len(resp.Kvs) > 0 {
+		existingHostname = string(resp.Kvs[0].Value)
+	}
+
+	var res *etcd.TxnResponse
+	if existingHostname != "" && existingHostname != hostname {
+		// If the NIC had different hostname previously,
+		// it is necessary to delete records associated with old hostname
+		existingHn2nicKey := h.prefix + "hostnames::nic::" + existingHostname + "::" + nic
+		res, err = kvc.Txn(ctx).If(
+			// Ensure the existence of keys and that hostname has not changed after the query.
+			// If these conditions are unmet, do nothing and return error later.
+			etcdutil.KeyExists(existingHn2nicKey),
+			etcdutil.KeyExists(nic2hnKey),
+			etcd.Compare(etcd.Value(nic2hnKey), "=", existingHostname),
+		).Then(
+			// Delete the existing assignment of hostname to the NIC, and associate new hostname and the NIC
+			etcd.OpDelete(existingHn2nicKey),
+			etcd.OpPut(nic2hnKey, hostname, etcd.WithLease(lease.ID)),
+			etcd.OpPut(hn2nicKey, nic, etcd.WithLease(lease.ID)),
+		).Commit()
+	} else {
+		// Otherwise, simply update keys associated with current hostname.
+		res, err = kvc.Txn(ctx).If(
+			// If keys have already exist and their values are different from the result of query
+			// executed just before, there seems to be race condition.
+			etcdutil.KeyExists(nic2hnKey),
+			etcd.Compare(etcd.Value(nic2hnKey), "!=", hostname),
+		).Then(
+		// Do nothing because the conditions must not be satisfied
+		).Else(
+			etcd.OpPut(nic2hnKey, hostname, etcd.WithLease(lease.ID)),
+			etcd.OpPut(hn2nicKey, nic, etcd.WithLease(lease.ID)),
+		).Commit()
+	}
+	if err != nil {
+		return errors.Wrap(err, "could not update hostname for the NIC")
+	}
+	if len(res.Responses) == 0 {
+		return fmt.Errorf("The hostname for the NIC (%s) seems to have been changed.")
+	}
+
+	return nil
+}
+
+func (h *DHCPHandler) unsetHostname(ctx context.Context, nic string) error {
+	nic2hnKey := h.prefix + "nics::hostname::" + nic
+
+	kvc := etcd.NewKV(h.client)
+	resp, err := kvc.Get(ctx, nic2hnKey)
+	if err != nil {
+		return errors.Wrap(err, "could not search hostname for the NIC")
+	}
+	if len(resp.Kvs) == 0 {
+		// When no hostname has been assigned previously, do nothing
+		return nil
+	}
+	existingHostname := string(resp.Kvs[0].Value)
+
+	hn2nicKey := h.prefix + "hostnames::nic::" + existingHostname + "::" + nic
+
+	res, err := kvc.Txn(ctx).If(
+		// ensure the existence of the keys and that the hostname has not been changed
+		etcdutil.KeyExists(nic2hnKey),
+		etcdutil.KeyExists(hn2nicKey),
+		etcd.Compare(etcd.Value(nic2hnKey), "=", existingHostname),
+	).Then(
+		etcd.OpDelete(nic2hnKey),
+		etcd.OpDelete(hn2nicKey),
+	).Commit()
+	if len(res.Responses) == 0 {
+		return fmt.Errorf("The hostname for the NIC (%s) seems to have been changed.")
+	}
+
+	return nil
 }
 
 func parseIP4(raw string) net.IP {
