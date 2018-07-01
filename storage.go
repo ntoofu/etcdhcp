@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"net"
-	"strings"
 	"time"
 
 	etcd "github.com/coreos/etcd/clientv3"
@@ -25,9 +24,11 @@ func (h *DHCPHandler) bootstrapLeasableRange(ctx context.Context) error {
 	for ip := h.start; !ip.Equal(h.end); ip = dhcp.IPAdd(ip, 1) {
 		freeIPKey := h.prefix + "ips::free::" + ip.String()
 		leasedIPKey := h.prefix + "ips::leased::" + ip.String()
+		reservedIPKey := h.prefix + "ips::reserved::" + ip.String()
 		res, err := kvc.Txn(ctx).If(
 			etcdutil.KeyMissing(freeIPKey),
 			etcdutil.KeyMissing(leasedIPKey),
+			etcdutil.KeyMissing(reservedIPKey),
 		).Then(
 			etcd.OpPut(freeIPKey, ip.String()),
 		).Commit()
@@ -60,51 +61,45 @@ func (h *DHCPHandler) monitorLeases(ctx context.Context) error {
 
 func (h *DHCPHandler) resurrectLeases(ctx context.Context) error {
 	kvc := etcd.NewKV(h.client)
+
 	leasedIPPrefix := h.prefix + "ips::leased::"
-	glog.V(2).Infof("listing ips under %v", leasedIPPrefix)
-	resp, err := kvc.Get(ctx, leasedIPPrefix, etcd.WithPrefix())
+	leased, err := getKeyExistenceMap(ctx, &kvc, leasedIPPrefix)
 	if err != nil {
-		return errors.Wrap(err, "could not list leased ips")
-	}
-
-	leased := map[string]struct{}{}
-	for _, kv := range resp.Kvs {
-		parts := strings.Split(string(kv.Key), "::")
-		ip := parts[len(parts)-1]
-
-		leased[ip] = struct{}{}
+		return errors.Wrap(err, "could not list lease ips")
 	}
 
 	freeIPPrefix := h.prefix + "ips::free::"
-	glog.V(2).Infof("listing ips under %v", freeIPPrefix)
-	resp, err = kvc.Get(ctx, freeIPPrefix, etcd.WithPrefix())
+	free, err := getKeyExistenceMap(ctx, &kvc, freeIPPrefix)
 	if err != nil {
-		return errors.Wrap(err, "could not list free ips")
+		return errors.Wrap(err, "could not list lease ips")
 	}
 
-	free := map[string]struct{}{}
-	for _, kv := range resp.Kvs {
-		parts := strings.Split(string(kv.Key), "::")
-		ip := parts[len(parts)-1]
-
-		free[ip] = struct{}{}
+	reservedIPPrefix := h.prefix + "ips::reserved::"
+	reserved, err := getKeyExistenceMap(ctx, &kvc, reservedIPPrefix)
+	if err != nil {
+		return errors.Wrap(err, "could not list lease ips")
 	}
 
 	for ip := h.start; !ip.Equal(h.end); ip = dhcp.IPAdd(ip, 1) {
-		if _, ok := free[ip.String()]; ok {
+		if _, ok := (*free)[ip.String()]; ok {
 			continue
 		}
-		if _, ok := leased[ip.String()]; ok {
+		if _, ok := (*leased)[ip.String()]; ok {
+			continue
+		}
+		if _, ok := (*reserved)[ip.String()]; ok {
 			continue
 		}
 
 		glog.V(2).Infof("moving %v from leased to free", ip)
 		freeIPKey := h.prefix + "ips::free::" + ip.String()
 		leasedIPKey := h.prefix + "ips::leased::" + ip.String()
+		reservedIPKey := h.prefix + "ips::reserved::" + ip.String()
 
 		res, err := kvc.Txn(ctx).If(
 			etcdutil.KeyMissing(freeIPKey),
 			etcdutil.KeyMissing(leasedIPKey),
+			etcdutil.KeyMissing(reservedIPKey),
 		).Then(
 			etcd.OpPut(freeIPKey, ip.String()),
 		).Commit()
@@ -118,18 +113,36 @@ func (h *DHCPHandler) resurrectLeases(ctx context.Context) error {
 	return nil
 }
 
+func getKeyExistenceMap(ctx context.Context, kvc *etcd.KV, prefix string) (*map[string]struct{}, error) {
+	glog.V(2).Infof("listing keys under %v", prefix)
+	resp, err := (*kvc).Get(ctx, prefix, etcd.WithPrefix())
+	if err != nil {
+		return nil, errors.Wrap(err, fmt.Sprintf("could not list keys under %v", prefix))
+	}
+
+	existence := map[string]struct{}{}
+	for _, kv := range resp.Kvs {
+		key := string(kv.Key[len(prefix):])
+		existence[key] = struct{}{}
+	}
+
+	return &existence, nil
+}
+
 func (h *DHCPHandler) nicLeasedIP(ctx context.Context, nic string) (net.IP, error) {
 	kvc := etcd.NewKV(h.client)
-	key := h.prefix + "nics::leased::" + nic
-	glog.V(2).Infof("GET %v", key)
-	resp, err := kvc.Get(ctx, key)
-	if err != nil {
-		return nil, errors.Wrap(err, "could not get etcd key")
+	for _, k := range []string{"reserved", "leased"} {
+		key := h.prefix + "nics::" + k + "::" + nic
+		glog.V(2).Infof("GET %v", key)
+		resp, err := kvc.Get(ctx, key)
+		if err != nil {
+			return nil, errors.Wrap(err, "could not get etcd key")
+		}
+		if len(resp.Kvs) > 0 {
+			return parseIP4(string(resp.Kvs[0].Value)), nil
+		}
 	}
-	if len(resp.Kvs) == 0 {
-		return nil, nil
-	}
-	return parseIP4(string(resp.Kvs[0].Value)), nil
+	return nil, nil
 }
 
 func (h *DHCPHandler) freeIP(ctx context.Context) (net.IP, error) {
@@ -156,6 +169,8 @@ func (h *DHCPHandler) leaseIP(ctx context.Context, ip net.IP, nic string, ttl ti
 	freeIPKey := h.prefix + "ips::free::" + ip.String()
 	leasedIPKey := h.prefix + "ips::leased::" + ip.String()
 	leasedNicKey := h.prefix + "nics::leased::" + nic
+	reservedIPKey := h.prefix + "ips::reserved::" + ip.String()
+	reservedNicKey := h.prefix + "nics::reserved::" + nic
 
 	res, err := etcd.NewKV(h.client).Txn(ctx).If(
 		// if the ip was previously free
@@ -164,6 +179,8 @@ func (h *DHCPHandler) leaseIP(ctx context.Context, ip net.IP, nic string, ttl ti
 		etcd.OpTxn([]etcd.Cmp{
 			etcdutil.KeyMissing(leasedIPKey),
 			etcdutil.KeyMissing(leasedNicKey),
+			etcdutil.KeyMissing(reservedIPKey),
+			etcdutil.KeyMissing(reservedNicKey),
 		}, []etcd.Op{
 			// Unfree it, and associate it with this nic
 			etcd.OpDelete(freeIPKey),
@@ -171,16 +188,42 @@ func (h *DHCPHandler) leaseIP(ctx context.Context, ip net.IP, nic string, ttl ti
 			etcd.OpPut(leasedNicKey, ip.String(), etcd.WithLease(lease.ID)),
 		}, nil),
 	).Else(
-		// Otherwise, we're _probably_ renewing it, so check that it's currently
-		// associated with us
-		etcd.OpTxn([]etcd.Cmp{
-			etcd.Compare(etcd.Value(leasedIPKey), "=", nic),
-			etcd.Compare(etcd.Value(leasedNicKey), "=", ip.String()),
-		}, []etcd.Op{
-			// And if it is, renew the lease
-			etcd.OpPut(leasedIPKey, nic, etcd.WithLease(lease.ID)),
-			etcd.OpPut(leasedNicKey, ip.String(), etcd.WithLease(lease.ID)),
-		}, nil),
+		etcd.OpTxn(
+			[]etcd.Cmp{
+				// check reservation for the NIC
+				etcdutil.KeyExists(reservedNicKey),
+			},
+			[]etcd.Op{
+				etcd.OpTxn(
+					[]etcd.Cmp{
+						// verify the request with the reservation
+						etcd.Compare(etcd.Value(reservedIPKey), "=", nic),
+						etcd.Compare(etcd.Value(reservedNicKey), "=", ip.String()),
+					},
+					[]etcd.Op{
+						etcd.OpPut(leasedIPKey, nic, etcd.WithLease(lease.ID)),
+						etcd.OpPut(leasedNicKey, ip.String(), etcd.WithLease(lease.ID)),
+					},
+					// An IP address is reserved for the NIC, but the requested address differs from that
+					nil,
+				),
+			},
+			[]etcd.Op{
+				etcd.OpTxn(
+					// Otherwise, we're _probably_ renewing it, so check that it's currently
+					// associated with us
+					[]etcd.Cmp{
+						etcd.Compare(etcd.Value(leasedIPKey), "=", nic),
+						etcd.Compare(etcd.Value(leasedNicKey), "=", ip.String()),
+					},
+					[]etcd.Op{
+						etcd.OpPut(leasedIPKey, nic, etcd.WithLease(lease.ID)),
+						etcd.OpPut(leasedNicKey, ip.String(), etcd.WithLease(lease.ID)),
+					},
+					nil,
+				),
+			},
+		),
 	).Commit()
 	if err != nil {
 		return errors.Wrap(err, "could not update for leased ip")
@@ -188,8 +231,29 @@ func (h *DHCPHandler) leaseIP(ctx context.Context, ip net.IP, nic string, ttl ti
 
 	// If we did an else in the nested transaction, we failed to actually update
 	// the lease
-	if !res.Responses[0].Response.(*etcdpb.ResponseOp_ResponseTxn).ResponseTxn.Succeeded {
-		return errors.New("ip is no longer free")
+	nestedRes := res.Responses[0].Response.(*etcdpb.ResponseOp_ResponseTxn).ResponseTxn
+	if res.Succeeded {
+		// Then
+		if !nestedRes.Succeeded {
+			// Then -> Else
+			return errors.New("ip is no longer free")
+		}
+	} else {
+		// Else
+		nestedRes2 := nestedRes.Responses[0].Response.(*etcdpb.ResponseOp_ResponseTxn).ResponseTxn
+		if nestedRes.Succeeded {
+			// Else -> Then
+			if !nestedRes2.Succeeded {
+				// Else -> Then -> Else
+				return errors.New("A different address is reserved")
+			}
+		} else {
+			// Else -> Else
+			if !nestedRes2.Succeeded {
+				// Else -> Else -> Else
+				return errors.New("ip is no longer free")
+			}
+		}
 	}
 
 	return nil
