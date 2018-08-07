@@ -5,6 +5,7 @@ import (
 	"flag"
 	"net/http"
 	_ "net/http/pprof"
+	"strings"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -20,8 +21,8 @@ var (
 	serverIP       = flag.String("dhcp.server-ip", "10.0.0.1", "dhcp server ip")
 	serverIF       = flag.String("dhcp.server-if", "eth0", "interface to serve on")
 	subnetMask     = flag.String("dhcp.subnet-mask", "255.255.240.0", "the subnet to serve")
-	router         = flag.String("dhcp.router", "10.0.0.1", "gateway to point clients to")
-	dns            = flag.String("dhcp.dns", "10.0.0.1", "dns server to point clients to")
+	router         = flag.String("dhcp.router", "10.0.0.1", "comma-separated list of gateways to point clients to")
+	dns            = flag.String("dhcp.dns", "10.0.0.1", "comma-separated list of dns servers to point clients to")
 	issueFrom      = flag.String("dhcp.issue-from", "10.0.0.10", "first ip address to issue to clients")
 	issueTo        = flag.String("dhcp.issue-to", "10.0.0.100", "last ip address to issue to clients")
 	leaseDuration  = flag.Duration("dhcp.lease", time.Hour, "dhcp lease duration")
@@ -49,8 +50,8 @@ func main() {
 		ip:            parseIP4(*serverIP),
 		options: dhcp.Options{
 			dhcp.OptionSubnetMask:       parseIP4(*subnetMask),
-			dhcp.OptionRouter:           parseIP4(*router),
-			dhcp.OptionDomainNameServer: parseIP4(*dns),
+			dhcp.OptionRouter:           parseIP4List(*router),
+			dhcp.OptionDomainNameServer: parseIP4List(*dns),
 		},
 	}
 
@@ -104,4 +105,14 @@ func listenAndServe(ctx context.Context, addr string, handler http.Handler) erro
 		return err
 	}
 	return nil
+}
+
+func parseIP4List(s string) []byte {
+	list := strings.Split(s, ",")
+	result := make([]byte, 4 * len(list))
+	for i, ip := range list {
+		head := 4 * i
+		copy(result[head:head+4], parseIP4(ip))
+	}
+	return result
 }
